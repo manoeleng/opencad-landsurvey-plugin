@@ -7,7 +7,7 @@
 //! ```
 //!
 //! Blank lines and lines beginning with `#` are ignored. Real-world survey
-//! exports vary in **delimiter** (comma / tab / runs of spaces) and **column
+//! exports vary in **delimiter** (comma / semicolon / tab / runs of spaces) and **column
 //! order** (PNEZD vs PENZD vs bespoke), so parsing is configurable via
 //! [`Format`]; [`parse`] keeps the convenient PNEZD default with auto-detected
 //! delimiter. The description is read as the REMAINDER from its column onward,
@@ -44,9 +44,11 @@ pub struct ParseOutcome {
 /// Field delimiter for a point file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delimiter {
-    /// Comma if the line has one, else tab, else any run of whitespace.
+    /// Select the first delimiter that yields numeric northing/easting fields:
+    /// comma, semicolon, tab, then whitespace.
     Auto,
     Comma,
+    Semicolon,
     Tab,
     /// Any run of ASCII whitespace (collapses repeated spaces — the common
     /// fixed-width / space-aligned export case).
@@ -98,17 +100,53 @@ impl Default for Format {
     }
 }
 
-fn resolve_delim(line: &str, d: Delimiter) -> Delimiter {
+/// Parse a survey number using either the usual decimal point or Brazilian
+/// notation (decimal comma, optional dot thousands separators).  When both
+/// separators occur, the last one is treated as the decimal separator.
+pub fn parse_number(raw: &str) -> Option<f64> {
+    let s: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '\u{a0}')
+        .collect();
+    if s.is_empty() {
+        return None;
+    }
+    let commas = s.matches(',').count();
+    let dots = s.matches('.').count();
+    let normalized = match (commas, dots) {
+        (0, 0) => s,
+        (c, 0) if c > 1 => s.replace(',', ""),
+        (1, 0) => s.replace(',', "."),
+        (0, d) if d > 1 => s.replace('.', ""),
+        (0, 1) => s,
+        (_, _) if s.rfind(',') > s.rfind('.') => s.replace('.', "").replace(',', "."),
+        (_, _) => s.replace(',', ""),
+    };
+    normalized.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+fn resolve_delim(line: &str, d: Delimiter, upto: usize, northing: usize, easting: usize) -> Delimiter {
     match d {
-        Delimiter::Auto => {
-            if line.contains(',') {
-                Delimiter::Comma
-            } else if line.contains('\t') {
-                Delimiter::Tab
-            } else {
-                Delimiter::Whitespace
-            }
-        }
+        Delimiter::Auto => [
+            Delimiter::Comma,
+            Delimiter::Semicolon,
+            Delimiter::Tab,
+            Delimiter::Whitespace,
+        ]
+        .into_iter()
+        .find(|candidate| {
+            let fields = split_fields(line, *candidate, upto);
+            fields
+                .get(northing)
+                .and_then(|s| parse_number(s))
+                .is_some()
+                && fields
+                    .get(easting)
+                    .and_then(|s| parse_number(s))
+                    .is_some()
+        })
+        .unwrap_or(Delimiter::Comma),
         other => other,
     }
 }
@@ -141,6 +179,7 @@ fn splitn_whitespace(line: &str, upto: usize) -> Vec<String> {
 fn split_fields(line: &str, delim: Delimiter, upto: usize) -> Vec<String> {
     match delim {
         Delimiter::Comma => line.splitn(upto, ',').map(|s| s.trim().to_string()).collect(),
+        Delimiter::Semicolon => line.splitn(upto, ';').map(|s| s.trim().to_string()).collect(),
         Delimiter::Tab => line.splitn(upto, '\t').map(|s| s.trim().to_string()).collect(),
         Delimiter::Whitespace => splitn_whitespace(line, upto),
         Delimiter::Auto => unreachable!("resolve_delim removes Auto"),
@@ -175,12 +214,12 @@ pub fn parse_with(text: &str, fmt: &Format) -> ParseOutcome {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let delim = resolve_delim(line, fmt.delimiter);
+        let delim = resolve_delim(line, fmt.delimiter, max_idx + 1, fmt.northing, fmt.easting);
         let f = split_fields(line, delim, max_idx + 1);
         let get = |i: usize| f.get(i).map(String::as_str).unwrap_or("");
 
-        let (Ok(northing), Ok(easting)) =
-            (get(fmt.northing).parse::<f64>(), get(fmt.easting).parse::<f64>())
+        let (Some(northing), Some(easting)) =
+            (parse_number(get(fmt.northing)), parse_number(get(fmt.easting)))
         else {
             out.skipped += 1;
             continue;
@@ -188,7 +227,7 @@ pub fn parse_with(text: &str, fmt: &Format) -> ParseOutcome {
 
         let elevation = fmt
             .elevation
-            .map(|i| get(i).parse::<f64>().unwrap_or(0.0))
+            .map(|i| parse_number(get(i)).unwrap_or(0.0))
             .unwrap_or(0.0);
         let number = fmt.number.map(|i| get(i).to_string()).unwrap_or_default();
         let description = fmt.description.map(|i| get(i).to_string()).unwrap_or_default();
@@ -274,6 +313,24 @@ garbage line
         let out = parse_with("1\t5000\t4000\t100\tCP\n2\t5001\t4001\t101\tIP\n", &fmt);
         assert_eq!(out.points.len(), 2);
         assert_eq!(out.points[1].easting, 4001.0);
+    }
+
+    #[test]
+    fn semicolon_and_brazilian_numbers() {
+        let out = parse("1;7.395.000,123;333.000,456;752,000;MARCO\n");
+        assert_eq!(out.points.len(), 1, "skipped {}", out.skipped);
+        let p = &out.points[0];
+        assert!((p.northing - 7_395_000.123).abs() < 1e-9);
+        assert!((p.easting - 333_000.456).abs() < 1e-9);
+        assert!((p.elevation - 752.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn semicolon_with_decimal_point() {
+        let out = parse("1;7395000.123;333000.456;752.5;MARCO\n");
+        assert_eq!(out.points.len(), 1, "skipped {}", out.skipped);
+        assert!((out.points[0].northing - 7_395_000.123).abs() < 1e-9);
+        assert!((out.points[0].easting - 333_000.456).abs() < 1e-9);
     }
 
     #[test]
